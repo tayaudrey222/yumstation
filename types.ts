@@ -8,6 +8,18 @@ export interface MenuItem {
   isComingSoon?: boolean;
 }
 
+export interface InventoryItem {
+  id: string;
+  menuItemId?: string; // Optional if not linked to menu item
+  itemName: string; // Generic name for any inventory item (menu or kitchen ingredient)
+  quantity: number;
+  unit: string; // e.g., 'pieces', 'kg', 'liters', 'packs'
+  reorderThreshold: number; // Alert when quantity falls below this
+  isMenuLinked?: boolean; // Whether this is linked to a menu item
+  lastRestocked?: any; // Firestore Timestamp
+  createdAt?: any; // Firestore Timestamp
+}
+
 export interface CartItem extends MenuItem {
   qty: number;
 }

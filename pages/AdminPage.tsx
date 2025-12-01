@@ -1,11 +1,12 @@
 import React, { useState, useContext, useEffect } from 'react';
 import { DataContext } from '../App';
-import { MenuItem, CategoryDefinition, DashboardStats, Order, AdminRole } from '../types';
+import { MenuItem, CategoryDefinition, DashboardStats, Order, AdminRole, InventoryItem } from '../types';
 import { saveMenuItem, deleteMenuItem } from '../services/menuService';
 import { saveCategory, deleteCategory } from '../services/categoryService';
 import { getOrders, updateOrderStatus } from '../services/orderService';
 import { getAdminByEmail, createAdmin, getAllAdmins, updateAdminRole } from '../services/adminService';
 import { logAudit, getRecentAuditLogs } from '../services/auditService';
+import { getInventoryItems, saveInventoryItem, deleteInventoryItem, restockInventory, restockInventoryById, getLowStockItems, deductInventory } from '../services/inventoryService';
 import { Timestamp } from 'firebase/firestore';
 import { auth } from '../firebase';
 import { signInWithEmailAndPassword, createUserWithEmailAndPassword, signOut, onAuthStateChanged, User } from 'firebase/auth';
@@ -29,13 +30,16 @@ const AdminPage: React.FC = () => {
   const [authLoading, setAuthLoading] = useState(true);
 
     // Tabs
-    const [activeTab, setActiveTab] = useState<'dashboard' | 'orders' | 'menu' | 'categories' | 'users'>('dashboard');
+    const [activeTab, setActiveTab] = useState<'dashboard' | 'orders' | 'menu' | 'categories' | 'users' | 'inventory'>('dashboard');
     const [showSidebar, setShowSidebar] = useState(false);
   
   const dataContext = useContext(DataContext);
     const [admins, setAdmins] = useState<any[]>([]);
     const [auditLogs, setAuditLogs] = useState<any[]>([]);
     const [showAuditModal, setShowAuditModal] = useState(false);
+    const [inventory, setInventory] = useState<InventoryItem[]>([]);
+    const [lowStockItems, setLowStockItems] = useState<InventoryItem[]>([]);
+    const [editingInventory, setEditingInventory] = useState<Partial<InventoryItem> | null>(null);
   
   // Dashboard & Order Stats
   const [orders, setOrders] = useState<Order[]>([]);
@@ -103,7 +107,10 @@ const AdminPage: React.FC = () => {
   };
 
   useEffect(() => {
-      if (userRole === 'super_admin') fetchAdmins();
+      if (userRole === 'super_admin') {
+          fetchAdmins();
+          fetchInventory();
+      }
   }, [userRole]);
 
   const fetchAuditLogs = async () => {
@@ -112,6 +119,17 @@ const AdminPage: React.FC = () => {
           setAuditLogs(logs);
       } catch (err) {
           console.error('Failed to load audit logs', err);
+      }
+  };
+
+  const fetchInventory = async () => {
+      try {
+          const items = await getInventoryItems();
+          setInventory(items);
+          const low = await getLowStockItems();
+          setLowStockItems(low);
+      } catch (err) {
+          console.error('Failed to fetch inventory', err);
       }
   };
 
@@ -150,13 +168,21 @@ const AdminPage: React.FC = () => {
       if (!confirmTarget) return;
       try {
           await updateOrderStatus(confirmTarget.id, 'completed', { confirmedAt: Timestamp.now(), confirmedTotal: confirmTarget.totalAmount });
+          
+          // Deduct inventory for each item in the order
+          for (const item of confirmTarget.items) {
+              await deductInventory(item.id, item.qty);
+          }
+          
           // audit
           await logAudit({ type: 'order_confirmed', actorId: user?.uid, actorEmail: user?.email || '', targetId: confirmTarget.id, details: { confirmedTotal: confirmTarget.totalAmount } });
-          toast.success('Order confirmed');
+          toast.success('Order confirmed & inventory updated');
           setConfirmTarget(null);
           fetchOrders();
+          fetchInventory(); // Refresh inventory to show updated stock
       } catch (err) {
           toast.error('Failed to confirm order');
+          console.error(err);
       }
   };
 
@@ -271,6 +297,66 @@ const AdminPage: React.FC = () => {
       }
   };
 
+  // --- INVENTORY HANDLERS ---
+  const handleSaveInventory = async (e: React.FormEvent) => {
+      e.preventDefault();
+      if (!editingInventory || editingInventory.quantity === undefined || !editingInventory.itemName) {
+          toast.error('Missing required fields');
+          return;
+      }
+      
+      try {
+          const isMenuLinked = !!(editingInventory.menuItemId);
+          const invItem: InventoryItem = {
+              id: editingInventory.id || Date.now().toString(),
+              menuItemId: editingInventory.menuItemId,
+              itemName: editingInventory.itemName || '',
+              quantity: editingInventory.quantity || 0,
+              unit: editingInventory.unit || 'pieces',
+              reorderThreshold: editingInventory.reorderThreshold || 5,
+              isMenuLinked: isMenuLinked,
+              lastRestocked: Timestamp.now()
+          };
+          await saveInventoryItem(invItem);
+          toast.success('Inventory item saved!');
+          setEditingInventory(null);
+          fetchInventory();
+      } catch (err) {
+          console.error(err);
+          toast.error('Failed to save inventory item');
+      }
+  };
+
+  const handleDeleteInventory = async (id: string) => {
+      if (window.confirm('Delete this inventory record?')) {
+          try {
+              await deleteInventoryItem(id);
+              toast.success('Inventory record deleted');
+              fetchInventory();
+          } catch (err) {
+              toast.error('Failed to delete inventory record');
+          }
+      }
+  };
+
+  const handleRestockInventory = async (id: string, currentQty: number) => {
+      const qty = prompt(`Add to stock (current: ${currentQty}):`, '10');
+      if (!qty || isNaN(parseInt(qty))) return;
+      
+      try {
+          const qtyNum = parseInt(qty);
+          const item = inventory.find(i => i.id === id);
+          if (item) {
+              // Use the new restockInventoryById function
+              await restockInventoryById(item.id, qtyNum);
+              toast.success(`Added ${qtyNum} to stock`);
+              fetchInventory();
+          }
+      } catch (err) {
+          toast.error('Failed to restock item');
+      }
+  };
+
   const handleDeleteCategory = async (id: string) => {
       if (window.confirm('Delete this category? Items in this category will remain but might be hidden.')) {
           await deleteCategory(id);
@@ -340,6 +426,11 @@ const AdminPage: React.FC = () => {
                         <BarChart3 size={20} /> Users
                     </button>
                 )}
+                {userRole === 'super_admin' && (
+                    <button onClick={() => setActiveTab('inventory')} className={`w-full flex items-center gap-3 px-4 py-3 rounded-xl transition ${activeTab === 'inventory' ? 'bg-yum-orange text-white shadow-lg' : 'text-gray-400 hover:bg-gray-800'}`}>
+                        <ShoppingBag size={20} /> Inventory
+                    </button>
+                )}
             </nav>
             <div className="p-4 border-t border-gray-700">
                 <Link to="/" className="flex items-center gap-2 text-gray-400 hover:text-white mb-4 text-sm px-2">
@@ -381,6 +472,11 @@ const AdminPage: React.FC = () => {
                                 <BarChart3 size={20} /> Users
                             </button>
                         )}
+                        {userRole === 'super_admin' && (
+                            <button onClick={() => { setActiveTab('inventory'); setShowSidebar(false); }} className={`w-full flex items-center gap-3 px-4 py-3 rounded-xl transition ${activeTab === 'inventory' ? 'bg-yum-orange text-white shadow-lg' : 'text-gray-400 hover:bg-gray-800'}`}>
+                                <ShoppingBag size={20} /> Inventory
+                            </button>
+                        )}
                     </nav>
                     <div className="p-4 border-t border-gray-700">
                         <Link to="/" onClick={() => setShowSidebar(false)} className="flex items-center gap-2 text-gray-400 hover:text-white mb-4 text-sm px-2">
@@ -409,7 +505,7 @@ const AdminPage: React.FC = () => {
                     <h2 className="text-3xl font-bold text-gray-800">Overview</h2>
                     
                     {/* Stats Cards */}
-                    <div className={`grid grid-cols-1 md:grid-cols-2 ${userRole === 'super_admin' ? 'lg:grid-cols-5' : 'lg:grid-cols-4'} gap-6`}>
+                    <div className={`grid grid-cols-1 md:grid-cols-2 ${userRole === 'super_admin' ? 'lg:grid-cols-6' : 'lg:grid-cols-4'} gap-6`}>
                         <div className="bg-white p-6 rounded-2xl shadow-sm border border-gray-100">
                             <div className="flex justify-between items-start">
                                 <div>
@@ -454,6 +550,17 @@ const AdminPage: React.FC = () => {
                                         <h3 className="text-3xl font-bold text-gray-800 mt-1">N{stats.revenuePotential.toLocaleString()}</h3>
                                     </div>
                                     <div className="p-2 bg-orange-50 text-orange-600 rounded-lg"><DollarSign size={20} /></div>
+                                </div>
+                            </div>
+                        )}
+                        {userRole === 'super_admin' && (
+                            <div className={`bg-white p-6 rounded-2xl shadow-sm border-2 ${lowStockItems.length > 0 ? 'border-red-300' : 'border-gray-100'}`}>
+                                <div className="flex justify-between items-start">
+                                    <div>
+                                        <p className={`text-sm font-medium ${lowStockItems.length > 0 ? 'text-red-600' : 'text-gray-500'}`}>Low Stock Items</p>
+                                        <h3 className={`text-3xl font-bold mt-1 ${lowStockItems.length > 0 ? 'text-red-600' : 'text-gray-800'}`}>{lowStockItems.length}</h3>
+                                    </div>
+                                    <div className={`p-2 rounded-lg ${lowStockItems.length > 0 ? 'bg-red-100 text-red-600' : 'bg-gray-100 text-gray-400'}`}><TrendingUp size={20} /></div>
                                 </div>
                             </div>
                         )}
@@ -751,6 +858,177 @@ const AdminPage: React.FC = () => {
                                 </ul>
                             )}
                         </div>
+                    </div>
+                </div>
+            )}
+
+            {/* --- INVENTORY TAB --- */}
+            {activeTab === 'inventory' && userRole === 'super_admin' && (
+                <div className="space-y-6 animate-fade-in">
+                    <div className="flex justify-between items-center">
+                        <h2 className="text-3xl font-bold text-gray-800">Inventory Management</h2>
+                        <button onClick={() => setEditingInventory({})} className="bg-yum-orange text-white px-4 py-2 rounded-lg flex items-center gap-2 hover:bg-orange-600">
+                            <Plus size={18} /> Add Inventory Item
+                        </button>
+                    </div>
+
+                    {/* Low Stock Alert */}
+                    {lowStockItems.length > 0 && (
+                        <div className="bg-red-50 border border-red-300 p-4 rounded-lg">
+                            <p className="text-red-700 font-bold">⚠️ {lowStockItems.length} item(s) below reorder threshold</p>
+                            <div className="flex flex-wrap gap-2 mt-2">
+                                {lowStockItems.map(item => (
+                                    <span key={item.id} className="text-xs bg-red-100 text-red-700 px-3 py-1 rounded-full">{item.itemName} ({item.quantity} {item.unit})</span>
+                                ))}
+                            </div>
+                        </div>
+                    )}
+
+                    <div className="bg-white rounded-2xl shadow-sm border border-gray-100 overflow-hidden">
+                        <div className="overflow-x-auto">
+                            <table className="w-full text-left text-sm">
+                                <thead className="bg-gray-50 text-gray-600 uppercase">
+                                    <tr>
+                                        <th className="px-4 py-3">Item Name</th>
+                                        <th className="px-4 py-3">Type</th>
+                                        <th className="px-4 py-3">Quantity</th>
+                                        <th className="px-4 py-3">Unit</th>
+                                        <th className="px-4 py-3">Reorder Threshold</th>
+                                        <th className="px-4 py-3">Last Restocked</th>
+                                        <th className="px-4 py-3 text-right">Actions</th>
+                                    </tr>
+                                </thead>
+                                <tbody className="divide-y divide-gray-100">
+                                    {inventory.map(item => {
+                                        const isLowStock = item.quantity < item.reorderThreshold;
+                                        return (
+                                            <tr key={item.id} className={isLowStock ? 'bg-red-50 hover:bg-red-100' : 'hover:bg-gray-50'}>
+                                                <td className={`px-4 py-3 font-medium ${isLowStock ? 'text-red-700' : 'text-gray-800'}`}>{item.itemName}</td>
+                                                <td className="px-4 py-3 text-xs">
+                                                    <span className={`px-2 py-1 rounded-full font-bold ${item.isMenuLinked ? 'bg-blue-100 text-blue-700' : 'bg-purple-100 text-purple-700'}`}>
+                                                        {item.isMenuLinked ? 'Menu' : 'Ingredient'}
+                                                    </span>
+                                                </td>
+                                                <td className={`px-4 py-3 font-bold ${isLowStock ? 'text-red-600' : 'text-gray-800'}`}>{item.quantity}</td>
+                                                <td className="px-4 py-3 text-gray-500">{item.unit}</td>
+                                                <td className="px-4 py-3 text-gray-500">{item.reorderThreshold}</td>
+                                                <td className="px-4 py-3 text-gray-500">
+                                                    {item.lastRestocked ? new Date(item.lastRestocked.seconds ? item.lastRestocked.seconds * 1000 : item.lastRestocked).toLocaleDateString() : 'N/A'}
+                                                </td>
+                                                <td className="px-4 py-3 text-right">
+                                                    <div className="flex justify-end gap-2">
+                                                        <button onClick={() => setEditingInventory(item)} className="px-3 py-1 rounded-md text-sm bg-blue-50 text-blue-700 hover:bg-blue-100">
+                                                            Edit
+                                                        </button>
+                                                        <button onClick={() => handleRestockInventory(item.id, item.quantity)} className="px-3 py-1 rounded-md text-sm bg-green-50 text-green-700 hover:bg-green-100">
+                                                            Restock
+                                                        </button>
+                                                        <button onClick={() => handleDeleteInventory(item.id)} className="px-3 py-1 rounded-md text-sm bg-red-50 text-red-700 hover:bg-red-100">
+                                                            Delete
+                                                        </button>
+                                                    </div>
+                                                </td>
+                                            </tr>
+                                        );
+                                    })}
+                                    {inventory.length === 0 && (
+                                        <tr><td colSpan={7} className="px-4 py-8 text-center text-gray-400">No inventory items. Click "Add Inventory Item" to get started.</td></tr>
+                                    )}
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+            )}
+
+            {/* --- INVENTORY ITEM MODAL --- */}
+            {editingInventory && (
+                <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4 backdrop-blur-sm">
+                    <div className="bg-white rounded-2xl w-full max-w-lg shadow-2xl overflow-hidden animate-scale-up">
+                        <div className="bg-gray-50 p-4 border-b flex justify-between items-center">
+                            <h3 className="font-bold text-lg text-gray-800">{editingInventory.id ? 'Edit Inventory Item' : 'New Inventory Item'}</h3>
+                            <button onClick={() => setEditingInventory(null)}><X size={20} className="text-gray-400 hover:text-gray-600"/></button>
+                        </div>
+                        <form onSubmit={handleSaveInventory} className="p-6 space-y-4">
+                            {/* Toggle between Menu Item and Kitchen Ingredient */}
+                            <div className="flex gap-4 mb-4 p-3 bg-gray-50 rounded-lg">
+                                <label className="flex items-center gap-2 cursor-pointer flex-1 p-2 rounded hover:bg-gray-100">
+                                    <input 
+                                        type="radio" 
+                                        name="itemType" 
+                                        checked={editingInventory.isMenuLinked === true || editingInventory.isMenuLinked === undefined}
+                                        onChange={() => setEditingInventory({...editingInventory, isMenuLinked: true, menuItemId: '', itemName: ''})}
+                                        className="w-4 h-4"
+                                    />
+                                    <span className="text-sm font-medium">Menu Item</span>
+                                </label>
+                                <label className="flex items-center gap-2 cursor-pointer flex-1 p-2 rounded hover:bg-gray-100">
+                                    <input 
+                                        type="radio" 
+                                        name="itemType" 
+                                        checked={editingInventory.isMenuLinked === false}
+                                        onChange={() => setEditingInventory({...editingInventory, isMenuLinked: false, menuItemId: undefined, itemName: ''})}
+                                        className="w-4 h-4"
+                                    />
+                                    <span className="text-sm font-medium">Kitchen Ingredient</span>
+                                </label>
+                            </div>
+
+                            {/* Menu Item Selection */}
+                            {editingInventory.isMenuLinked !== false ? (
+                                <div>
+                                    <label className="label-text">Select Menu Item *</label>
+                                    <select className="input-field" required value={editingInventory.menuItemId || ''} onChange={e => {
+                                        const menuItem = dataContext?.menuItems.find(m => m.id === e.target.value);
+                                        setEditingInventory({...editingInventory, menuItemId: e.target.value, itemName: menuItem?.name || ''});
+                                    }}>
+                                        <option value="">Select a menu item...</option>
+                                        {dataContext?.menuItems.map(m => <option key={m.id} value={m.id}>{m.name}</option>)}
+                                    </select>
+                                </div>
+                            ) : (
+                                <div>
+                                    <label className="label-text">Ingredient Name *</label>
+                                    <input 
+                                        className="input-field" 
+                                        placeholder="e.g., Tomato Sauce, Chicken Breast, Rice Flour" 
+                                        required 
+                                        value={editingInventory.itemName || ''} 
+                                        onChange={e => setEditingInventory({...editingInventory, itemName: e.target.value})} 
+                                    />
+                                </div>
+                            )}
+
+                            <div className="grid grid-cols-2 gap-4">
+                                <div>
+                                    <label className="label-text">Quantity *</label>
+                                    <input className="input-field" type="number" min="0" required value={editingInventory.quantity !== undefined ? editingInventory.quantity : ''} onChange={e => setEditingInventory({...editingInventory, quantity: Number(e.target.value)})} />
+                                </div>
+                                <div>
+                                    <label className="label-text">Unit *</label>
+                                    <select className="input-field" required value={editingInventory.unit || 'pieces'} onChange={e => setEditingInventory({...editingInventory, unit: e.target.value})}>
+                                        <option value="pieces">pieces</option>
+                                        <option value="kg">kg</option>
+                                        <option value="g">grams</option>
+                                        <option value="liters">liters</option>
+                                        <option value="ml">milliliters</option>
+                                        <option value="packs">packs</option>
+                                        <option value="boxes">boxes</option>
+                                        <option value="bottles">bottles</option>
+                                        <option value="cans">cans</option>
+                                    </select>
+                                </div>
+                            </div>
+                            <div>
+                                <label className="label-text">Reorder Threshold *</label>
+                                <input className="input-field" type="number" min="1" required value={editingInventory.reorderThreshold || ''} onChange={e => setEditingInventory({...editingInventory, reorderThreshold: Number(e.target.value)})} />
+                                <p className="text-xs text-gray-500 mt-1">Alert when stock falls below this amount</p>
+                            </div>
+                            <div className="flex gap-2 pt-4">
+                                <button type="button" onClick={() => setEditingInventory(null)} className="flex-1 px-4 py-2 rounded-lg border border-gray-300 text-gray-700 hover:bg-gray-50">Cancel</button>
+                                <button type="submit" className="flex-1 px-4 py-2 rounded-lg bg-yum-orange text-white hover:bg-orange-600">Save Item</button>
+                            </div>
+                        </form>
                     </div>
                 </div>
             )}
