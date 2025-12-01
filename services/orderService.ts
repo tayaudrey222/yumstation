@@ -1,5 +1,5 @@
 import { db } from '../firebase';
-import { collection, addDoc, getDocs, query, orderBy, Timestamp } from 'firebase/firestore';
+import { collection, addDoc, getDocs, query, orderBy, Timestamp, updateDoc, doc } from 'firebase/firestore';
 import { Order } from '../types';
 
 const ORDERS_COLLECTION = 'orders';
@@ -28,5 +28,24 @@ export const getOrders = async (): Promise<Order[]> => {
     } catch (error) {
         console.error("Error fetching orders:", error);
         return [];
+    }
+};
+
+export const updateOrderStatus = async (
+    orderId: string,
+    status: 'pending' | 'completed' | 'cancelled',
+    extras?: { confirmedAt?: any; confirmedTotal?: number }
+) => {
+    try {
+        const ref = doc(db, ORDERS_COLLECTION, orderId);
+        const payload: any = { status };
+        if (extras) {
+            if (extras.confirmedAt) payload.confirmedAt = extras.confirmedAt;
+            if (typeof extras.confirmedTotal === 'number') payload.confirmedTotal = extras.confirmedTotal;
+        }
+        await updateDoc(ref, payload);
+    } catch (error) {
+        console.error('Failed to update order status', error);
+        throw error;
     }
 };

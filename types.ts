@@ -13,6 +13,14 @@ export interface CartItem extends MenuItem {
 }
 
 export type OrderType = 'delivery' | 'pickup';
+export type AdminRole = 'super_admin' | 'admin';
+
+export interface AdminUser {
+  id: string;
+  email: string;
+  role: AdminRole;
+  createdAt?: any; // Firestore Timestamp
+}
 
 export interface Order {
     id: string;
@@ -23,7 +31,9 @@ export interface Order {
     items: CartItem[];
     totalAmount: number;
     createdAt: any; // Firestore Timestamp
-    status: 'pending' | 'completed' | 'cancelled';
+  status: 'pending' | 'completed' | 'cancelled';
+  confirmedAt?: any; // Firestore Timestamp when admin confirmed
+  confirmedTotal?: number; // The recorded confirmed total at confirmation time
 }
 
 export interface CategoryDefinition {

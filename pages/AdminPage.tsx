@@ -1,9 +1,12 @@
 import React, { useState, useContext, useEffect } from 'react';
 import { DataContext } from '../App';
-import { MenuItem, CategoryDefinition, DashboardStats, Order } from '../types';
+import { MenuItem, CategoryDefinition, DashboardStats, Order, AdminRole } from '../types';
 import { saveMenuItem, deleteMenuItem } from '../services/menuService';
 import { saveCategory, deleteCategory } from '../services/categoryService';
-import { getOrders } from '../services/orderService';
+import { getOrders, updateOrderStatus } from '../services/orderService';
+import { getAdminByEmail, createAdmin, getAllAdmins, updateAdminRole } from '../services/adminService';
+import { logAudit, getRecentAuditLogs } from '../services/auditService';
+import { Timestamp } from 'firebase/firestore';
 import { auth } from '../firebase';
 import { signInWithEmailAndPassword, createUserWithEmailAndPassword, signOut, onAuthStateChanged, User } from 'firebase/auth';
 import toast from 'react-hot-toast';
@@ -11,7 +14,7 @@ import { Link } from 'react-router-dom';
 import { 
     Trash2, Edit2, Plus, LogOut, LayoutDashboard, 
     UtensilsCrossed, Layers, BarChart3, Settings, Save,
-    TrendingUp, ShoppingBag, DollarSign, X, Receipt, ArrowRight
+    TrendingUp, ShoppingBag, DollarSign, X, Receipt, ArrowRight, Menu
 } from 'lucide-react';
 
 const availableIcons = ['bowl', 'sprout', 'utensils', 'carrot', 'drumstick', 'cookie', 'leaf', 'sandwich', 'flame', 'glass', 'star'];
@@ -19,18 +22,25 @@ const availableColors = ['orange', 'yellow', 'red', 'green', 'blue', 'purple', '
 
 const AdminPage: React.FC = () => {
   const [user, setUser] = useState<User | null>(null);
+  const [userRole, setUserRole] = useState<AdminRole | null>(null);
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [isRegistering, setIsRegistering] = useState(false);
   const [authLoading, setAuthLoading] = useState(true);
 
-  // Tabs
-  const [activeTab, setActiveTab] = useState<'dashboard' | 'orders' | 'menu' | 'categories'>('dashboard');
+    // Tabs
+    const [activeTab, setActiveTab] = useState<'dashboard' | 'orders' | 'menu' | 'categories' | 'users'>('dashboard');
+    const [showSidebar, setShowSidebar] = useState(false);
   
   const dataContext = useContext(DataContext);
+    const [admins, setAdmins] = useState<any[]>([]);
+    const [auditLogs, setAuditLogs] = useState<any[]>([]);
+    const [showAuditModal, setShowAuditModal] = useState(false);
   
   // Dashboard & Order Stats
   const [orders, setOrders] = useState<Order[]>([]);
+    const [unconfirmedCount, setUnconfirmedCount] = useState<number>(0);
+    const [confirmTarget, setConfirmTarget] = useState<Order | null>(null);
   const [stats, setStats] = useState<DashboardStats>({
       totalItems: 0, 
       totalCategories: 0, 
@@ -45,29 +55,112 @@ const AdminPage: React.FC = () => {
   const [selectedOrder, setSelectedOrder] = useState<Order | null>(null);
 
   useEffect(() => {
-    const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
+    const unsubscribe = onAuthStateChanged(auth, async (currentUser) => {
         setUser(currentUser);
-        setAuthLoading(false);
         if (currentUser) {
+            // Fetch user role
+            const adminUser = await getAdminByEmail(currentUser.email || '');
+            if (adminUser) {
+                setUserRole(adminUser.role);
+            }
             fetchOrders();
         }
+        setAuthLoading(false);
     });
     return () => unsubscribe();
   }, []);
+
+  // Close mobile sidebar when switching tabs
+  useEffect(() => {
+      setShowSidebar(false);
+  }, [activeTab]);
 
   const fetchOrders = async () => {
       const allOrders = await getOrders();
       setOrders(allOrders);
       
-      // Calculate Stats
-      const totalRevenue = allOrders.reduce((sum, order) => sum + order.totalAmount, 0);
+      // Calculate Stats using only confirmed (completed) orders
+      const completed = allOrders.filter(o => o.status === 'completed');
+      const pending = allOrders.filter(o => o.status === 'pending');
+      const totalRevenue = completed.reduce((sum, order) => sum + (order.totalAmount || 0), 0);
       setStats({
           totalItems: dataContext?.menuItems.length || 0,
           totalCategories: dataContext?.categories.length || 0,
-          totalOrders: allOrders.length,
+          totalOrders: completed.length,
           revenuePotential: totalRevenue
       });
+      setUnconfirmedCount(pending.length);
   };
+
+  const fetchAdmins = async () => {
+      try {
+          if (userRole !== 'super_admin') return;
+          const list = await getAllAdmins();
+          setAdmins(list);
+      } catch (err) {
+          console.error('Failed to fetch admins', err);
+      }
+  };
+
+  useEffect(() => {
+      if (userRole === 'super_admin') fetchAdmins();
+  }, [userRole]);
+
+  const fetchAuditLogs = async () => {
+      try {
+          const logs = await getRecentAuditLogs(100);
+          setAuditLogs(logs);
+      } catch (err) {
+          console.error('Failed to load audit logs', err);
+      }
+  };
+
+  const handleChangeRole = async (uid: string, newRole: AdminRole) => {
+      try {
+          const target = admins.find(a => a.id === uid) || null;
+          const oldRole = target?.role || 'admin';
+          await updateAdminRole(uid, newRole);
+          // audit
+          await logAudit({ type: 'role_changed', actorId: user?.uid, actorEmail: user?.email || '', targetId: uid, targetEmail: target?.email || '', details: { from: oldRole, to: newRole } });
+          toast.success('Role updated');
+          fetchAdmins();
+      } catch (err) {
+          toast.error('Failed to update role');
+      }
+  };
+
+  const handleConfirmOrder = async (orderId: string) => {
+      // open confirmation modal instead of immediately confirming
+      const target = orders.find(o => o.id === orderId) || null;
+      setConfirmTarget(target);
+  };
+
+  const handleCancelOrder = async (orderId: string) => {
+      if (!window.confirm('Cancel this order?')) return;
+      try {
+          await updateOrderStatus(orderId, 'cancelled');
+          toast('Order cancelled');
+          fetchOrders();
+      } catch (err) {
+          toast.error('Failed to cancel order');
+      }
+  };
+
+  const confirmApprove = async () => {
+      if (!confirmTarget) return;
+      try {
+          await updateOrderStatus(confirmTarget.id, 'completed', { confirmedAt: Timestamp.now(), confirmedTotal: confirmTarget.totalAmount });
+          // audit
+          await logAudit({ type: 'order_confirmed', actorId: user?.uid, actorEmail: user?.email || '', targetId: confirmTarget.id, details: { confirmedTotal: confirmTarget.totalAmount } });
+          toast.success('Order confirmed');
+          setConfirmTarget(null);
+          fetchOrders();
+      } catch (err) {
+          toast.error('Failed to confirm order');
+      }
+  };
+
+  const confirmCancel = () => setConfirmTarget(null);
 
   // Re-calculate menu/cat stats if they change
   useEffect(() => {
@@ -84,10 +177,18 @@ const AdminPage: React.FC = () => {
     e.preventDefault();
     try {
         if (isRegistering) {
-            await createUserWithEmailAndPassword(auth, email, password);
+            const result = await createUserWithEmailAndPassword(auth, email, password);
+            // Create admin record with default role and use returned role
+            const adminUser = await createAdmin(result.user.uid, email);
+            if (adminUser) setUserRole(adminUser.role);
+            // audit: admin created (self-registration)
+            await logAudit({ type: 'admin_created', actorId: result.user.uid, actorEmail: email, targetId: adminUser.id, targetEmail: adminUser.email, details: { role: adminUser.role } });
             toast.success('Account created! Welcome Admin.');
         } else {
             await signInWithEmailAndPassword(auth, email, password);
+            // Fetch role on login
+            const adminUser = await getAdminByEmail(email);
+            if (adminUser) setUserRole(adminUser.role);
             toast.success('Welcome back Admin');
         }
     } catch (error: any) {
@@ -156,6 +257,20 @@ const AdminPage: React.FC = () => {
     }
   };
 
+  // Toggle availability directly from the list (not the modal)
+  const handleToggleAvailability = async (itemId: string) => {
+      const item = dataContext?.menuItems.find(i => i.id === itemId);
+      if (!item) return;
+      try {
+          await saveMenuItem({ ...item, isAvailable: !item.isAvailable });
+          toast.success(`${item.name} is now ${!item.isAvailable ? 'Available' : 'Unavailable'}`);
+          dataContext?.refreshData();
+      } catch (err) {
+          console.error('Failed to toggle availability', err);
+          toast.error('Failed to update availability');
+      }
+  };
+
   const handleDeleteCategory = async (id: string) => {
       if (window.confirm('Delete this category? Items in this category will remain but might be hidden.')) {
           await deleteCategory(id);
@@ -201,8 +316,8 @@ const AdminPage: React.FC = () => {
 
   return (
     <div className="flex h-screen bg-gray-100 overflow-hidden">
-        {/* Sidebar */}
-        <aside className="w-64 bg-yum-dark text-white flex flex-col shadow-2xl z-20">
+        {/* Sidebar for desktop */}
+        <aside className="hidden md:flex w-64 bg-yum-dark text-white flex-col shadow-2xl z-20">
             <div className="p-6 border-b border-gray-700 flex items-center gap-3">
                 <div className="w-8 h-8 rounded bg-yum-orange flex items-center justify-center font-brand text-xl">Y</div>
                 <span className="font-bold text-lg tracking-wide">Yum Admin</span>
@@ -220,6 +335,11 @@ const AdminPage: React.FC = () => {
                 <button onClick={() => setActiveTab('categories')} className={`w-full flex items-center gap-3 px-4 py-3 rounded-xl transition ${activeTab === 'categories' ? 'bg-yum-orange text-white shadow-lg' : 'text-gray-400 hover:bg-gray-800'}`}>
                     <Layers size={20} /> Categories
                 </button>
+                {userRole === 'super_admin' && (
+                    <button onClick={() => setActiveTab('users')} className={`w-full flex items-center gap-3 px-4 py-3 rounded-xl transition ${activeTab === 'users' ? 'bg-yum-orange text-white shadow-lg' : 'text-gray-400 hover:bg-gray-800'}`}>
+                        <BarChart3 size={20} /> Users
+                    </button>
+                )}
             </nav>
             <div className="p-4 border-t border-gray-700">
                 <Link to="/" className="flex items-center gap-2 text-gray-400 hover:text-white mb-4 text-sm px-2">
@@ -231,16 +351,65 @@ const AdminPage: React.FC = () => {
             </div>
         </aside>
 
+        {/* Mobile sidebar overlay */}
+        {showSidebar && (
+            <aside className="fixed inset-0 z-40 md:hidden">
+                <div className="absolute inset-0 bg-black/40" onClick={() => setShowSidebar(false)} />
+                <div className="absolute left-0 top-0 bottom-0 w-64 bg-yum-dark text-white flex flex-col shadow-2xl">
+                    <div className="p-4 border-b border-gray-700 flex items-center justify-between">
+                        <div className="flex items-center gap-3">
+                            <div className="w-8 h-8 rounded bg-yum-orange flex items-center justify-center font-brand text-xl">Y</div>
+                            <span className="font-bold text-lg tracking-wide">Yum Admin</span>
+                        </div>
+                        <button onClick={() => setShowSidebar(false)} className="p-2 text-gray-300"><X size={18} /></button>
+                    </div>
+                    <nav className="flex-1 p-4 space-y-2">
+                        <button onClick={() => { setActiveTab('dashboard'); setShowSidebar(false); }} className={`w-full flex items-center gap-3 px-4 py-3 rounded-xl transition ${activeTab === 'dashboard' ? 'bg-yum-orange text-white shadow-lg' : 'text-gray-400 hover:bg-gray-800'}`}>
+                            <LayoutDashboard size={20} /> Dashboard
+                        </button>
+                        <button onClick={() => { setActiveTab('orders'); setShowSidebar(false); }} className={`w-full flex items-center gap-3 px-4 py-3 rounded-xl transition ${activeTab === 'orders' ? 'bg-yum-orange text-white shadow-lg' : 'text-gray-400 hover:bg-gray-800'}`}>
+                            <Receipt size={20} /> Orders
+                        </button>
+                        <button onClick={() => { setActiveTab('menu'); setShowSidebar(false); }} className={`w-full flex items-center gap-3 px-4 py-3 rounded-xl transition ${activeTab === 'menu' ? 'bg-yum-orange text-white shadow-lg' : 'text-gray-400 hover:bg-gray-800'}`}>
+                            <UtensilsCrossed size={20} /> Menu Items
+                        </button>
+                        <button onClick={() => { setActiveTab('categories'); setShowSidebar(false); }} className={`w-full flex items-center gap-3 px-4 py-3 rounded-xl transition ${activeTab === 'categories' ? 'bg-yum-orange text-white shadow-lg' : 'text-gray-400 hover:bg-gray-800'}`}>
+                            <Layers size={20} /> Categories
+                        </button>
+                        {userRole === 'super_admin' && (
+                            <button onClick={() => { setActiveTab('users'); setShowSidebar(false); }} className={`w-full flex items-center gap-3 px-4 py-3 rounded-xl transition ${activeTab === 'users' ? 'bg-yum-orange text-white shadow-lg' : 'text-gray-400 hover:bg-gray-800'}`}>
+                                <BarChart3 size={20} /> Users
+                            </button>
+                        )}
+                    </nav>
+                    <div className="p-4 border-t border-gray-700">
+                        <Link to="/" onClick={() => setShowSidebar(false)} className="flex items-center gap-2 text-gray-400 hover:text-white mb-4 text-sm px-2">
+                            <LogOut size={16} className="rotate-180"/> View Live Site
+                        </Link>
+                        <button onClick={() => { handleLogout(); setShowSidebar(false); }} className="w-full flex items-center justify-center gap-2 bg-red-600/20 text-red-400 hover:bg-red-600 hover:text-white py-2 rounded-lg transition text-sm">
+                            <LogOut size={16} /> Sign Out
+                        </button>
+                    </div>
+                </div>
+            </aside>
+        )}
+
         {/* Main Content */}
-        <main className="flex-1 overflow-y-auto p-8 relative">
-            
+        <main className="flex-1 overflow-y-auto p-4 md:p-8 relative">
+            {/* Mobile topbar */}
+            <div className="md:hidden flex items-center justify-between mb-4">
+                <button onClick={() => setShowSidebar(true)} className="p-2 bg-white rounded-lg shadow text-yum-dark"><Menu size={20} /></button>
+                <h2 className="text-lg font-bold text-gray-800">Yum Admin</h2>
+                <div />
+            </div>
+
             {/* --- DASHBOARD TAB --- */}
             {activeTab === 'dashboard' && (
                 <div className="space-y-6 animate-fade-in">
                     <h2 className="text-3xl font-bold text-gray-800">Overview</h2>
                     
                     {/* Stats Cards */}
-                    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
+                    <div className={`grid grid-cols-1 md:grid-cols-2 ${userRole === 'super_admin' ? 'lg:grid-cols-5' : 'lg:grid-cols-4'} gap-6`}>
                         <div className="bg-white p-6 rounded-2xl shadow-sm border border-gray-100">
                             <div className="flex justify-between items-start">
                                 <div>
@@ -271,12 +440,23 @@ const AdminPage: React.FC = () => {
                         <div className="bg-white p-6 rounded-2xl shadow-sm border border-gray-100">
                             <div className="flex justify-between items-start">
                                 <div>
-                                    <p className="text-gray-500 text-sm font-medium">Total Revenue</p>
-                                    <h3 className="text-3xl font-bold text-gray-800 mt-1">N{stats.revenuePotential.toLocaleString()}</h3>
+                                    <p className="text-gray-500 text-sm font-medium">Unconfirmed Orders</p>
+                                    <h3 className="text-3xl font-bold text-gray-800 mt-1">{unconfirmedCount}</h3>
                                 </div>
-                                <div className="p-2 bg-orange-50 text-orange-600 rounded-lg"><DollarSign size={20} /></div>
+                                <div className="p-2 bg-yellow-50 text-yellow-600 rounded-lg"><Receipt size={20} /></div>
                             </div>
                         </div>
+                        {userRole === 'super_admin' && (
+                            <div className="bg-white p-6 rounded-2xl shadow-sm border border-gray-100">
+                                <div className="flex justify-between items-start">
+                                    <div>
+                                        <p className="text-gray-500 text-sm font-medium">Total Revenue</p>
+                                        <h3 className="text-3xl font-bold text-gray-800 mt-1">N{stats.revenuePotential.toLocaleString()}</h3>
+                                    </div>
+                                    <div className="p-2 bg-orange-50 text-orange-600 rounded-lg"><DollarSign size={20} /></div>
+                                </div>
+                            </div>
+                        )}
                     </div>
 
                     {/* Recent 5 Orders */}
@@ -360,7 +540,20 @@ const AdminPage: React.FC = () => {
                                                 {order.createdAt?.seconds ? new Date(order.createdAt.seconds * 1000).toLocaleString() : ''}
                                             </td>
                                             <td className="p-4 text-right font-bold text-yum-orange">N{order.totalAmount.toLocaleString()}</td>
-                                            <td className="p-4 text-gray-400"><ArrowRight size={16} /></td>
+                                            <td className="p-4 text-right">
+                                                {order.status === 'pending' ? (
+                                                    <div className="flex justify-end gap-2">
+                                                        <button onClick={(e) => { e.stopPropagation(); handleConfirmOrder(order.id); }} className="bg-green-600 text-white px-3 py-1 rounded-md text-sm">Confirm</button>
+                                                        {userRole === 'super_admin' && (
+                                                            <button onClick={(e) => { e.stopPropagation(); handleCancelOrder(order.id); }} className="bg-red-100 text-red-600 px-3 py-1 rounded-md text-sm">Cancel</button>
+                                                        )}
+                                                    </div>
+                                                ) : order.status === 'completed' ? (
+                                                    <span className="inline-block px-3 py-1 rounded-full bg-green-50 text-green-700 text-xs font-bold">Completed</span>
+                                                ) : (
+                                                    <span className="inline-block px-3 py-1 rounded-full bg-red-50 text-red-700 text-xs font-bold">Cancelled</span>
+                                                )}
+                                            </td>
                                         </tr>
                                     ))}
                                     {orders.length === 0 && <tr><td colSpan={7} className="p-8 text-center text-gray-400">No orders found.</td></tr>}
@@ -376,9 +569,11 @@ const AdminPage: React.FC = () => {
                 <div className="space-y-6 animate-fade-in">
                     <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
                         <h2 className="text-3xl font-bold text-gray-800">Menu Management</h2>
-                        <button onClick={() => setEditingItem({})} className="bg-yum-orange text-white px-4 py-2 rounded-xl font-bold shadow-lg hover:bg-orange-600 flex items-center gap-2">
-                            <Plus size={18} /> Add Item
-                        </button>
+                        {userRole === 'super_admin' && (
+                            <button onClick={() => setEditingItem({})} className="bg-yum-orange text-white px-4 py-2 rounded-xl font-bold shadow-lg hover:bg-orange-600 flex items-center gap-2">
+                                <Plus size={18} /> Add Item
+                            </button>
+                        )}
                     </div>
 
                     {/* Filter */}
@@ -419,9 +614,16 @@ const AdminPage: React.FC = () => {
                                              item.isAvailable ? <span className="text-green-500 bg-green-50 px-2 py-1 rounded text-xs font-bold">Active</span> : 
                                              <span className="text-red-500 bg-red-50 px-2 py-1 rounded text-xs font-bold">Unavailable</span>}
                                         </td>
-                                        <td className="p-4 text-right flex justify-end gap-2">
-                                            <button onClick={() => setEditingItem(item)} className="text-blue-500 hover:bg-blue-50 p-2 rounded-lg"><Edit2 size={16} /></button>
-                                            <button onClick={() => handleDeleteItem(item.id)} className="text-red-500 hover:bg-red-50 p-2 rounded-lg"><Trash2 size={16} /></button>
+                                        <td className="p-4 text-right flex justify-end items-center gap-2">
+                                            <button onClick={() => handleToggleAvailability(item.id)} aria-pressed={item.isAvailable} className={`${item.isAvailable ? 'bg-green-50 text-green-700' : 'bg-red-50 text-red-700'} px-3 py-1 rounded-full text-xs font-bold transition`}>
+                                                {item.isAvailable ? 'Available' : 'Unavailable'}
+                                            </button>
+                                            {userRole === 'super_admin' && (
+                                                <>
+                                                    <button onClick={() => setEditingItem(item)} className="text-blue-500 hover:bg-blue-50 p-2 rounded-lg"><Edit2 size={16} /></button>
+                                                    <button onClick={() => handleDeleteItem(item.id)} className="text-red-500 hover:bg-red-50 p-2 rounded-lg"><Trash2 size={16} /></button>
+                                                </>
+                                            )}
                                         </td>
                                     </tr>
                                 ))}
@@ -436,9 +638,11 @@ const AdminPage: React.FC = () => {
                 <div className="space-y-6 animate-fade-in">
                     <div className="flex justify-between items-center">
                         <h2 className="text-3xl font-bold text-gray-800">Categories</h2>
-                        <button onClick={() => setEditingCategory({})} className="bg-yum-orange text-white px-4 py-2 rounded-xl font-bold shadow-lg hover:bg-orange-600 flex items-center gap-2">
-                            <Plus size={18} /> New Category
-                        </button>
+                        {userRole === 'super_admin' && (
+                            <button onClick={() => setEditingCategory({})} className="bg-yum-orange text-white px-4 py-2 rounded-xl font-bold shadow-lg hover:bg-orange-600 flex items-center gap-2">
+                                <Plus size={18} /> New Category
+                            </button>
+                        )}
                     </div>
 
                     <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
@@ -459,11 +663,94 @@ const AdminPage: React.FC = () => {
                                     <span className="flex items-center gap-1"><Settings size={14}/> {cat.icon}</span>
                                 </div>
                                 <div className="flex gap-2 mt-4 pt-4 border-t border-gray-100">
-                                    <button onClick={() => setEditingCategory(cat)} className="flex-1 bg-gray-50 hover:bg-gray-100 text-gray-600 py-2 rounded-lg text-sm font-medium transition">Edit</button>
-                                    <button onClick={() => handleDeleteCategory(cat.id)} className="flex-1 bg-red-50 hover:bg-red-100 text-red-500 py-2 rounded-lg text-sm font-medium transition">Delete</button>
+                                    {userRole === 'super_admin' ? (
+                                        <>
+                                            <button onClick={() => setEditingCategory(cat)} className="flex-1 bg-gray-50 hover:bg-gray-100 text-gray-600 py-2 rounded-lg text-sm font-medium transition">Edit</button>
+                                            <button onClick={() => handleDeleteCategory(cat.id)} className="flex-1 bg-red-50 hover:bg-red-100 text-red-500 py-2 rounded-lg text-sm font-medium transition">Delete</button>
+                                        </>
+                                    ) : (
+                                        <div className="flex-1 bg-gray-50 text-gray-500 py-2 rounded-lg text-sm font-medium text-center">View only</div>
+                                    )}
                                 </div>
                             </div>
                         ))}
+                    </div>
+                </div>
+            )}
+
+            {/* --- USERS TAB (Role Management) --- */}
+            {activeTab === 'users' && userRole === 'super_admin' && (
+                <div className="space-y-6 animate-fade-in">
+                    <div className="flex justify-between items-center">
+                        <h2 className="text-3xl font-bold text-gray-800">Admin Users</h2>
+                        <div className="flex items-center gap-3">
+                            <button onClick={fetchAdmins} className="bg-gray-100 px-3 py-2 rounded-md text-sm">Refresh</button>
+                            <button onClick={() => { setShowAuditModal(true); fetchAuditLogs(); }} className="bg-gray-50 px-3 py-2 rounded-md text-sm">View Audit</button>
+                        </div>
+                    </div>
+
+                    <div className="bg-white rounded-2xl shadow-sm border border-gray-100 p-4">
+                        <table className="w-full text-left text-sm">
+                            <thead className="bg-gray-50 text-gray-600 uppercase">
+                                <tr>
+                                    <th className="p-3">Email</th>
+                                    <th className="p-3">Role</th>
+                                    <th className="p-3">Created</th>
+                                    <th className="p-3 text-right">Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody className="divide-y divide-gray-100">
+                                {admins.map(a => (
+                                    <tr key={a.id} className="hover:bg-gray-50">
+                                        <td className="p-3">{a.email}</td>
+                                        <td className="p-3">{a.role}</td>
+                                        <td className="p-3 text-gray-500">{a.createdAt ? new Date(a.createdAt.seconds ? a.createdAt.seconds * 1000 : a.createdAt).toLocaleString() : ''}</td>
+                                        <td className="p-3 text-right">
+                                            {a.id === user?.uid ? (
+                                                <span className="text-sm text-gray-400">You</span>
+                                            ) : (
+                                                <div className="flex justify-end gap-2">
+                                                    <button onClick={() => handleChangeRole(a.id, a.role === 'admin' ? 'super_admin' : 'admin')} className="px-3 py-1 rounded-md text-sm bg-blue-50 text-blue-700">
+                                                        {a.role === 'admin' ? 'Promote' : 'Demote'}
+                                                    </button>
+                                                </div>
+                                            )}
+                                        </td>
+                                    </tr>
+                                ))}
+                                {admins.length === 0 && (
+                                    <tr><td colSpan={4} className="p-6 text-center text-gray-400">No admin users found.</td></tr>
+                                )}
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            )}
+
+            {/* Audit Modal */}
+            {showAuditModal && (
+                <div className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center p-4">
+                    <div className="bg-white w-full max-w-2xl rounded-2xl shadow-xl overflow-hidden">
+                        <div className="p-4 border-b flex justify-between items-center">
+                            <h3 className="font-bold">Audit Log</h3>
+                            <button onClick={() => setShowAuditModal(false)} className="text-gray-500">Close</button>
+                        </div>
+                        <div className="p-4 max-h-[60vh] overflow-y-auto">
+                            {auditLogs.length === 0 ? (
+                                <p className="text-gray-400">No audit entries yet.</p>
+                            ) : (
+                                <ul className="space-y-3">
+                                    {auditLogs.map((l: any) => (
+                                        <li key={l.id} className="p-3 bg-gray-50 rounded-md">
+                                            <div className="text-sm font-bold">{l.type}</div>
+                                            <div className="text-xs text-gray-500">Actor: {l.actorEmail || l.actorId} • Target: {l.targetEmail || l.targetId}</div>
+                                            <div className="text-xs text-gray-700 mt-2">{JSON.stringify(l.details)}</div>
+                                            <div className="text-xs text-gray-400 mt-1">{l.timestamp ? (new Date(l.timestamp.seconds ? l.timestamp.seconds * 1000 : l.timestamp).toLocaleString()) : ''}</div>
+                                        </li>
+                                    ))}
+                                </ul>
+                            )}
+                        </div>
                     </div>
                 </div>
             )}
@@ -613,6 +900,30 @@ const AdminPage: React.FC = () => {
                         <div className="p-4 bg-gray-50 border-t flex justify-between items-center">
                             <span className="font-bold text-gray-500 uppercase text-xs">Total Amount</span>
                             <span className="font-bold text-2xl text-yum-dark">N{selectedOrder.totalAmount.toLocaleString()}</span>
+                        </div>
+                    </div>
+                </div>
+            )}
+
+            {/* Confirm Order Modal */}
+            {confirmTarget && (
+                <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4 backdrop-blur-sm">
+                    <div className="bg-white rounded-2xl w-full max-w-md shadow-2xl overflow-hidden animate-scale-up">
+                        <div className="bg-gray-50 p-4 border-b flex justify-between items-center">
+                            <h3 className="font-bold text-lg text-gray-800">Confirm Order</h3>
+                            <button onClick={() => setConfirmTarget(null)}><X size={20} className="text-gray-400 hover:text-gray-600"/></button>
+                        </div>
+                        <div className="p-6 space-y-4">
+                            <p className="text-sm text-gray-600">You're about to confirm the following order. This will record the amount as the confirmed total.</p>
+                            <div className="bg-gray-50 p-4 rounded-lg">
+                                <p className="font-bold">{confirmTarget.customerName}</p>
+                                <p className="text-sm text-gray-600">Order ID: {confirmTarget.id}</p>
+                                <p className="text-sm text-gray-800 font-bold mt-2">Total: N{confirmTarget.totalAmount.toLocaleString()}</p>
+                            </div>
+                            <div className="flex gap-3 justify-end">
+                                <button onClick={() => setConfirmTarget(null)} className="px-4 py-2 rounded-md bg-gray-100">Cancel</button>
+                                <button onClick={confirmApprove} className="px-4 py-2 rounded-md bg-green-600 text-white">Confirm Order</button>
+                            </div>
                         </div>
                     </div>
                 </div>
