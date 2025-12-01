@@ -1,5 +1,5 @@
 import React, { useContext } from 'react';
-import { ShoppingCart, ChefHat } from 'lucide-react';
+import { ShoppingCart } from 'lucide-react';
 import { CartContext, DataContext } from '../App';
 
 const Navbar: React.FC = () => {
@@ -21,7 +21,7 @@ const Navbar: React.FC = () => {
         <div className="container mx-auto px-4 py-3 flex justify-between items-center">
           <div className="flex items-center gap-2">
              <div className="w-12 h-12 rounded-full border-2 border-yum-yellow bg-white flex items-center justify-center text-yum-orange shadow-sm overflow-hidden">
-                <ChefHat size={28} />
+               <img src="/logo.png" alt="Yum Station" className="w-full h-full object-cover" />
              </div>
             <h1 className="font-brand text-2xl tracking-wide text-white drop-shadow-md">Yum Station</h1>
           </div>
