@@ -49,8 +49,8 @@ const HomePage: React.FC = () => {
       <footer className="bg-yum-dark text-white mt-12 pt-12 pb-24 px-4 border-t-4 border-yum-orange">
         <div className="container mx-auto flex flex-col items-center text-center space-y-6">
             <div className="flex flex-col items-center gap-3">
-                <div className="h-20 w-20 rounded-full border-2 border-yum-yellow bg-white flex items-center justify-center text-yum-dark">
-                    <span className="font-brand text-3xl">Y</span>
+                <div className="h-20 w-20 rounded-full border-2 border-yum-yellow bg-white overflow-hidden flex items-center justify-center">
+                  <img src="/logo.png" alt="Yum Station" className="w-full h-full object-cover" />
                 </div>
                 <h2 className="font-brand text-4xl text-yum-yellow">Yum Station</h2>
                 <p className="text-xl font-medium text-white tracking-wide italic">Crave and Enjoy</p>

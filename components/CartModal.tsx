@@ -51,7 +51,8 @@ const CartModal: React.FC = () => {
         await createOrder({
             customerName: name,
             phone,
-            address: orderType === 'delivery' ? address : undefined,
+            // Firestore does not accept `undefined` values — send empty string for pickup
+            address: orderType === 'delivery' ? address : '',
             orderType,
             items: cart,
             totalAmount: total
